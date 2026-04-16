@@ -9,7 +9,6 @@ from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from ultralytics import YOLO
-from paddleocr import PaddleOCR
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ARTIFACTS = os.path.join(BASE_DIR, "artifacts")
@@ -28,7 +27,6 @@ class MLService:
         self.device = torch.device(os.getenv('ML_DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.lpd_model = None
         self.lpr_model = None
-        self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='ch', use_gpu=torch.cuda.is_available(), show_log=False)
         self._load_models()
 
     def _load_models(self):
@@ -43,6 +41,7 @@ class MLService:
 
         if os.path.exists(lpr_path) and os.path.exists(config_path) and os.path.exists(charset_path):
             checkpoint = torch.load(lpr_path, map_location=self.device, weights_only=False)
+
             with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
             with open(charset_path, "r") as f:
@@ -72,89 +71,161 @@ class MLService:
                 refine_iters=config.get("refine_iters", 1),
                 dropout=config.get("dropout", 0.1)
             )
-            self.lpr_model.load_state_dict(checkpoint.state_dict() if hasattr(checkpoint, "state_dict") else checkpoint)
+
+            self.lpr_model.load_state_dict(
+                checkpoint.state_dict() if hasattr(checkpoint, "state_dict") else checkpoint
+            )
             self.lpr_model.to(self.device)
             self.lpr_model.eval()
 
     def detect_plates(self, image):
         h, w = image.shape[:2]
         plates = []
-        if self.lpd_model is None: return plates
+
+        if self.lpd_model is None:
+            return plates
+
         with self.inference_lock:
             results = self.lpd_model(image, verbose=False)
+
         for r in results:
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 conf = float(box.conf[0])
+
                 pad = 30
-                x1, y1, x2, y2 = max(0, x1-pad), max(0, y1-pad), min(w, x2+pad), min(h, y2+pad)
-                plates.append({"confidence": conf, "cropped_image": image[y1:y2, x1:x2], "bbox": [x1, y1, x2, y2]})
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
+
+                crop = image[y1:y2, x1:x2]
+
+                plates.append({
+                    "confidence": conf,
+                    "cropped_image": crop,
+                    "bbox": [x1, y1, x2, y2]
+                })
+
         return plates
 
     def recognize(self, cropped_image):
-        if cropped_image is None: return "", ([], [])
+        if self.lpr_model is None or cropped_image is None:
+            return "", ([], [])
+
         corrected = self._correct_rotation_safe(cropped_image)
-        
-        # 1. Try PARSeq first
         resized = cv2.resize(corrected, (128, 32))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().unsqueeze(0).to(self.device) / 255.0
-        
+
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+        tensor = tensor.unsqueeze(0).to(self.device)
+
         with torch.no_grad():
-            logits = self.lpr_model(tensor, max_length=15)
-            tokens, probs = self.lpr_model.tokenizer.decode(logits.softmax(-1))
-        
-        parseq_text = tokens[0]
-        parseq_conf = np.mean(probs[0])
-
-        # 2. Fallback to PaddleOCR if PARSeq is unsure or text is too short (typical for failed Hanzi)
-        if parseq_conf < 0.8 or len(parseq_text) < 4:
             with self.inference_lock:
-                paddle_res = self.paddle_ocr.ocr(corrected, cls=True)
-            if paddle_res and paddle_res[0]:
-                paddle_text = paddle_res[0][0][1][0]
-                paddle_conf = paddle_res[0][0][1][1]
-                return paddle_text, (list(paddle_text), [float(paddle_conf)]*len(paddle_text))
+                logits = self.lpr_model(tensor, max_length=15)
+                tokens, probs = self.lpr_model.tokenizer.decode(logits.softmax(-1))
+                
 
-        return parseq_text, (list(parseq_text), [float(p) for p in probs[0]])
+        return tokens[0], (list(tokens[0]), [float(p) for p in probs[0]])
 
     def _correct_rotation_safe(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
         edges = cv2.Canny(gray, 50, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return image
-        cnt = max(contours, key=cv2.contourArea)
-        approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
-        if len(approx) == 4:
-            pts = self._order_points(approx.reshape(4, 2))
-            w = int(max(np.linalg.norm(pts[2] - pts[3]), np.linalg.norm(pts[1] - pts[0])))
-            h = int(max(np.linalg.norm(pts[1] - pts[2]), np.linalg.norm(pts[0] - pts[3])))
-            dst = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
-            M = cv2.getPerspectiveTransform(pts.astype("float32"), dst)
-            return cv2.warpPerspective(image, M, (w, h))
-        rect = cv2.minAreaRect(cnt)
-        (x, y), (w, h), angle = rect
-        if w < h: angle -= 90
-        M = cv2.getRotationMatrix2D((image.shape[1]//2, image.shape[0]//2), angle, 1.0)
-        return cv2.warpAffine(image, M, (image.shape[1], image.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
+        if not contours:
+            return image
+
+        cnt = max(contours, key=cv2.contourArea)
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype("float32")
+            rect = self._order_points(pts)
+            (tl, tr, br, bl) = rect
+
+            width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+            height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+
+            if width == 0 or height == 0:
+                return image
+
+            x_coords = pts[:, 0]
+            y_coords = pts[:, 1]
+            bbox_w = x_coords.max() - x_coords.min()
+            bbox_h = y_coords.max() - y_coords.min()
+
+            diagonal = np.sqrt(bbox_w ** 2 + bbox_h ** 2)
+            ideal = np.array([
+                [x_coords.min(), y_coords.min()],
+                [x_coords.max(), y_coords.min()],
+                [x_coords.max(), y_coords.max()],
+                [x_coords.min(), y_coords.max()],
+            ], dtype="float32")
+            ideal_ordered = self._order_points(ideal)
+            max_deviation = np.max(np.linalg.norm(rect - ideal_ordered, axis=1))
+
+            PERSPECTIVE_THRESHOLD = 0.05
+            if diagonal > 0 and (max_deviation / diagonal) < PERSPECTIVE_THRESHOLD:
+                return image
+
+            dst = np.array(
+                [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+                dtype="float32"
+            )
+            M = cv2.getPerspectiveTransform(rect, dst)
+            return cv2.warpPerspective(image, M, (width, height))
+
+        ROTATION_THRESHOLD_DEG = 3.0
+
+        rect = cv2.minAreaRect(cnt)
+        (cx, cy), (w, h), angle = rect
+
+        if w < h:
+            angle -= 90
+
+        angle = (angle + 90) % 180 - 90
+
+        if abs(angle) < ROTATION_THRESHOLD_DEG:
+            return image
+
+        M = cv2.getRotationMatrix2D(
+            (image.shape[1] // 2, image.shape[0] // 2), angle, 1.0
+        )
+        return cv2.warpAffine(
+            image, M, (image.shape[1], image.shape[0]),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
     def _order_points(self, pts):
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1)
-        rect[0], rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
         diff = np.diff(pts, axis=1)
-        rect[1], rect[3] = pts[np.argmin(diff)], pts[np.argmax(diff)]
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
         return rect
 
     def recognize_image(self, image_bytes):
-        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        np_img = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
         plates = self.detect_plates(image)
         results = []
         for p in plates:
             text, (chars, confs) = self.recognize(p["cropped_image"])
-            results.append({"text": text, "confidence": p["confidence"], "bbox": p["bbox"], "char_confidence": dict(zip(chars, confs)), "img": cv2.imencode(".jpg", p["cropped_image"])[1].tobytes()})
+            results.append({
+                "text": text,
+                "confidence": p["confidence"],
+                "bbox": p["bbox"],
+                "char_confidence": dict(zip(chars, confs)),
+                "img": cv2.imencode(".jpg", p["cropped_image"])[1].tobytes()
+            })
         return results
 
 ml_service = MLService()

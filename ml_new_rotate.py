@@ -34,19 +34,15 @@ class MLService:
         lpr_path = "app/artifacts/lpr/evaluated_ocr_model.pt"
         config_path = "app/configs/model/parseq.yaml"
         charset_path = "app/configs/charset/label.yaml"
-
         if os.path.exists(lpd_path):
             self.lpd_model = YOLO(lpd_path)
             self.lpd_model.to(self.device)
-
         if os.path.exists(lpr_path) and os.path.exists(config_path) and os.path.exists(charset_path):
             checkpoint = torch.load(lpr_path, map_location=self.device, weights_only=False)
-
             with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
             with open(charset_path, "r") as f:
                 charset = yaml.safe_load(f)
-
             self.lpr_model = PARSeq(
                 charset_train=charset["model"]["charset_train"],
                 charset_test=charset["model"]["charset_train"],
@@ -71,7 +67,6 @@ class MLService:
                 refine_iters=config.get("refine_iters", 1),
                 dropout=config.get("dropout", 0.1)
             )
-
             self.lpr_model.load_state_dict(
                 checkpoint.state_dict() if hasattr(checkpoint, "state_dict") else checkpoint
             )
@@ -81,69 +76,52 @@ class MLService:
     def detect_plates(self, image):
         h, w = image.shape[:2]
         plates = []
-
         if self.lpd_model is None:
             return plates
-
         with self.inference_lock:
             results = self.lpd_model(image, verbose=False)
-
         for r in results:
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 conf = float(box.conf[0])
-
-                pad = 30
+                pad = 10
                 x1 = max(0, x1 - pad)
                 y1 = max(0, y1 - pad)
                 x2 = min(w, x2 + pad)
                 y2 = min(h, y2 + pad)
-
                 crop = image[y1:y2, x1:x2]
-
                 plates.append({
                     "confidence": conf,
                     "cropped_image": crop,
                     "bbox": [x1, y1, x2, y2]
                 })
-
         return plates
 
     def recognize(self, cropped_image):
         if self.lpr_model is None or cropped_image is None:
             return "", ([], [])
-
         corrected = self._correct_rotation_safe(cropped_image)
         resized = cv2.resize(corrected, (128, 32))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         tensor = tensor.unsqueeze(0).to(self.device)
-
         with torch.no_grad():
             with self.inference_lock:
                 logits = self.lpr_model(tensor, max_length=15)
                 tokens, probs = self.lpr_model.tokenizer.decode(logits.softmax(-1))
-                
-
         return tokens[0], (list(tokens[0]), [float(p) for p in probs[0]])
 
     def _correct_rotation_safe(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-        
         edges = cv2.Canny(gray, 50, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
         if not contours:
             return image
-
         cnt = max(contours, key=cv2.contourArea)
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
         if len(approx) == 4:
             pts = approx.reshape(4, 2)
             rect = self._order_points(pts)
@@ -153,7 +131,6 @@ class MLService:
             dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
             M = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
             return cv2.warpPerspective(image, M, (width, height))
-
         rect = cv2.minAreaRect(cnt)
         (x, y), (w, h), angle = rect
         if w < h:

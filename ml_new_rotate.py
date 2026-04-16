@@ -20,6 +20,7 @@ from strhub.models.parseq.system import PARSeq
 
 logger = logging.getLogger(__name__)
 
+
 class MLService:
     def __init__(self):
         self.ml_executor = ThreadPoolExecutor(max_workers=1)
@@ -44,6 +45,7 @@ class MLService:
 
             with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
+
             with open(charset_path, "r") as f:
                 charset = yaml.safe_load(f)
 
@@ -72,11 +74,43 @@ class MLService:
                 dropout=config.get("dropout", 0.1)
             )
 
-            self.lpr_model.load_state_dict(
-                checkpoint.state_dict() if hasattr(checkpoint, "state_dict") else checkpoint
-            )
+            self.lpr_model.load_state_dict(checkpoint.state_dict() if hasattr(checkpoint, "state_dict") else checkpoint)
             self.lpr_model.to(self.device)
             self.lpr_model.eval()
+
+    def _ensure_bgr(self, image):
+        if image is None:
+            return None
+        if len(image.shape) == 2:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        return image
+
+    def _load_image(self, image_source, original_image_bytes=None):
+        original_format = "JPEG"
+
+        if isinstance(image_source, str):
+            pil_image = Image.open(image_source)
+            original_format = pil_image.format or "JPEG"
+
+            if pil_image.mode == "RGBA":
+                pil_image = pil_image.convert("RGB")
+
+            cv_image = cv2.imread(image_source)
+
+            if cv_image is None and original_image_bytes:
+                np_img = np.frombuffer(original_image_bytes, np.uint8)
+                cv_image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+
+        elif isinstance(image_source, np.ndarray):
+            cv_image = image_source
+
+        else:
+            np_img = np.frombuffer(image_source, np.uint8)
+            cv_image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+
+        return cv_image, original_format
 
     def detect_plates(self, image):
         h, w = image.shape[:2]
@@ -85,15 +119,27 @@ class MLService:
         if self.lpd_model is None:
             return plates
 
+        img = self._ensure_bgr(image)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        img = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = cv2.equalizeHist(l)
+        img = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
         with self.inference_lock:
-            results = self.lpd_model(image, verbose=False)
+            results = self.lpd_model(img, verbose=False)
 
         for r in results:
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 conf = float(box.conf[0])
 
-                pad = 30
+                pad = 10
                 x1 = max(0, x1 - pad)
                 y1 = max(0, y1 - pad)
                 x2 = min(w, x2 + pad)
@@ -122,9 +168,8 @@ class MLService:
 
         with torch.no_grad():
             with self.inference_lock:
-                logits = self.lpr_model(tensor, max_length=15)
+                logits = self.lpr_model(tensor, max_length=12)
                 tokens, probs = self.lpr_model.tokenizer.decode(logits.softmax(-1))
-                
 
         return tokens[0], (list(tokens[0]), [float(p) for p in probs[0]])
 
@@ -211,21 +256,27 @@ class MLService:
         rect[1] = pts[np.argmin(diff)]
         rect[3] = pts[np.argmax(diff)]
         return rect
-
+    
     def recognize_image(self, image_bytes):
-        np_img = np.frombuffer(image_bytes, np.uint8)
-        image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+        image, _ = self._load_image(image_bytes)
+        image = self._ensure_bgr(image)
+
         plates = self.detect_plates(image)
+
         results = []
         for p in plates:
-            text, (chars, confs) = self.recognize(p["cropped_image"])
+            crop = self._ensure_bgr(p["cropped_image"])
+            text, (chars, confs) = self.recognize(crop)
+
             results.append({
                 "text": text,
                 "confidence": p["confidence"],
                 "bbox": p["bbox"],
                 "char_confidence": dict(zip(chars, confs)),
-                "img": cv2.imencode(".jpg", p["cropped_image"])[1].tobytes()
+                "img": cv2.imencode(".jpg", crop)[1].tobytes()
             })
+
         return results
+
 
 ml_service = MLService()
